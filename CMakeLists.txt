@@ -47,6 +47,14 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto SSL)
 find_package(nlohmann_json "3.6.1" REQUIRED)
 find_package(Python "${IRODS_PYTHON_VERSION}" REQUIRED COMPONENTS Development)
 
+include(CMakePrintHelpers)
+cmake_print_properties(
+  TARGETS
+  Python::Python
+  PROPERTIES
+
+)
+
 set(
   IRODS_RULE_ENGINE_PLUGIN-PYTHON_COMPILE_DEFINITIONS
   RODS_SERVER
@@ -89,11 +97,19 @@ set(
       ${CMAKE_DL_LIBS}
       irods_common
       irods_server
-      Python::Python
       nlohmann_json::nlohmann_json
+      "-Wl,--no-as-needed"
+      Python::Python
       )
 
-  target_compile_definitions(${PLUGIN} PRIVATE ${IRODS_RULE_ENGINE_PYTHON_PLUGIN_COMPILE_DEFINITIONS} ${IRODS_COMPILE_DEFINITIONS} ${IRODS_COMPILE_DEFINITIONS_PRIVATE})
+  target_compile_definitions(
+      ${PLUGIN}
+      PRIVATE
+      ${IRODS_RULE_ENGINE_PYTHON_PLUGIN_COMPILE_DEFINITIONS}
+      ${IRODS_COMPILE_DEFINITIONS}
+      ${IRODS_COMPILE_DEFINITIONS_PRIVATE}
+      )
+
   #target_compile_options(${PLUGIN} PRIVATE -Wno-write-strings)
 
 install(
