@@ -11,13 +11,17 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 
 #include <boost/version.hpp>
 #pragma GCC diagnostic push
 #if BOOST_VERSION < 108100
 #  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
+#include <boost/any.hpp>
+#include <boost/config.hpp>
 #include <boost/date_time.hpp>
+#include <boost/exception/all.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
@@ -103,41 +107,126 @@ static std::recursive_mutex python_mutex;
 
 namespace
 {
-	const char* const rule_engine_name = "python";
+	static inline constexpr const char* const rule_engine_name = "python";
 	using log_re = irods::experimental::log::rule_engine;
-}
 
-void register_regexes_from_array(const nlohmann::json& _array, const std::string& _instance_name)
-{
-	try {
-		for (const auto& elem : _array) {
-			try {
-				const auto& tmp = elem.get_ref<const std::string&>();
-				RuleExistsHelper::Instance()->registerRuleRegex(tmp);
-				// clang-format off
-				log_re::debug({
-					{"rule_engine_plugin", rule_engine_name},
-					{"instance_name", _instance_name},
-					{"regex", tmp},
-				});
-				// clang-format on
-			}
-			catch (const boost::bad_any_cast&) {
-				// clang-format off
-				log_re::error({
-					{"rule_engine_plugin", rule_engine_name},
-					{"instance_name", _instance_name},
-					{"log_message", "failed to cast pep_regex_to_match to string"},
-				});
-				// clang-format on
-				continue;
+	// NOLINTBEGIN(cert-err58-cpp, cppcoreguidelines-avoid-non-const-global-variables)
+	namespace interpreter_config
+	{
+		bool use_isolated_config;
+	}
+
+	namespace interpreter_config_defaults
+	{
+		const bool use_isolated_config = false;
+	}
+	// NOLINTEND(cert-err58-cpp, cppcoreguidelines-avoid-non-const-global-variables)
+
+	static BOOST_FORCEINLINE void set_default_interpreter_config()
+	{
+		interpreter_config::use_isolated_config = interpreter_config_defaults::use_isolated_config;
+	}
+
+	static BOOST_FORCEINLINE void register_default_regexes(const std::string& _instance_name)
+	{
+		RuleExistsHelper::Instance()->registerRuleRegex(STATIC_PEP_RULE_REGEX);
+		RuleExistsHelper::Instance()->registerRuleRegex(DYNAMIC_PEP_RULE_REGEX);
+
+		// clang-format off
+		log_re::debug({
+			{"rule_engine_plugin", rule_engine_name},
+			{"instance_name", _instance_name},
+			{"log_message", "No regexes found in server_config for Python RE - using default regexes"},
+			{"static_pep_rule_regex", STATIC_PEP_RULE_REGEX},
+			{"dynamic_pep_rule_regex", DYNAMIC_PEP_RULE_REGEX},
+		});
+		// clang-format on
+	}
+
+	static irods::error get_re_configs(const std::string& _instance_name)
+	{
+		try {
+			const auto& rule_engines = irods::get_server_property<const nlohmann::json&>(
+				std::vector<std::string>{irods::KW_CFG_PLUGIN_CONFIGURATION, irods::KW_CFG_PLUGIN_TYPE_RULE_ENGINE});
+			for (const auto& rule_engine : rule_engines) {
+				const auto& inst_name = rule_engine.at(irods::KW_CFG_INSTANCE_NAME).get_ref<const std::string&>();
+				if (inst_name != _instance_name) {
+					continue;
+				}
+
+				// all configuration is currently optional
+				const auto plugin_spec_cfg = rule_engine.find(irods::KW_CFG_PLUGIN_SPECIFIC_CONFIGURATION);
+				if (plugin_spec_cfg == rule_engine.end()) {
+					set_default_interpreter_config();
+					// clang-format off
+					log_re::trace({
+						{"rule_engine_plugin", rule_engine_name},
+						{"log_message", "Using default interpreter configuration"},
+						{"instance_name", _instance_name},
+					});
+					// clang-format on
+
+					register_default_regexes(_instance_name);
+					return SUCCESS();
+				}
+
+				// TODO Enable non core.py Python rulebases
+				const auto regex_set_cfg = plugin_spec_cfg->find(irods::KW_CFG_RE_PEP_REGEX_SET);
+				if (regex_set_cfg == plugin_spec_cfg->end()) {
+					register_default_regexes(_instance_name);
+				}
+				else {
+					for (const auto& rule_regex_cfg : *regex_set_cfg) {
+						const auto& rule_regex_str = rule_regex_cfg.get_ref<const std::string&>();
+						RuleExistsHelper::Instance()->registerRuleRegex(rule_regex_str);
+					}
+				}
+
+				const auto interpreter_cfg = plugin_spec_cfg->find("interpreter");
+				if (interpreter_cfg == plugin_spec_cfg->end()) {
+					set_default_interpreter_config();
+					// clang-format off
+					log_re::trace({
+						{"rule_engine_plugin", rule_engine_name},
+						{"log_message", "Using default interpreter configuration"},
+						{"instance_name", _instance_name},
+					});
+					// clang-format on
+
+					return SUCCESS();
+				}
+
+				const auto use_isolated_config_cfg_iter = interpreter_cfg->find("use_isolated_config");
+				if (use_isolated_config_cfg_iter == interpreter_cfg->end()) {
+					interpreter_config::use_isolated_config = interpreter_config_defaults::use_isolated_config;
+				}
+				else {
+					interpreter_config::use_isolated_config = use_isolated_config_cfg_iter->get<bool>();
+				}
+
+				return SUCCESS();
 			}
 		}
-	}
-	catch (const boost::bad_any_cast&) {
-		std::stringstream msg;
-		msg << "[" << _instance_name << "] failed to any_cast a std::vector<boost::any>&";
-		THROW(INVALID_ANY_CAST, msg.str());
+		catch (const irods::exception& e) {
+			return irods::error(e);
+		}
+		catch (const boost::bad_any_cast& e) {
+			return ERROR(INVALID_ANY_CAST, e.what());
+		}
+		catch (const std::out_of_range& e) {
+			return ERROR(KEY_NOT_FOUND, e.what());
+		}
+		catch (const nlohmann::json::exception& e) {
+			return ERROR(SYS_LIBRARY_ERROR, e.what());
+		}
+		catch (const std::exception& e) {
+			return ERROR(SYS_INTERNAL_ERR, e.what());
+		}
+		catch (...) {
+			return ERROR(SYS_UNKNOWN_ERROR, "an unknown error occurred while loading plugin configuration");
+		}
+
+		return ERROR(SYS_INVALID_INPUT_PARAM, "failed to find plugin configuration");
 	}
 }
 
@@ -339,7 +428,49 @@ namespace
 
 static irods::error start(irods::default_re_ctx&, const std::string& _instance_name)
 {
+	irods::error ret = get_re_configs(_instance_name);
+	if (!ret.ok()) {
+		// clang-format off
+		log_re::error({
+			{"rule_engine_plugin", rule_engine_name},
+			{"log_message", "Error loading plugin configuration"},
+			{"instance_name", _instance_name},
+			{"error_result", ret.result()},
+		});
+		// clang-format on
+		return ret;
+	}
+
 	try {
+		PyStatus py_status;
+		PyPreConfig py_preconfig;
+		PyConfig py_config;
+
+		if (interpreter_config::use_isolated_config) {
+			PyPreConfig_InitIsolatedConfig(&py_preconfig);
+		}
+		else {
+			PyPreConfig_InitPythonConfig(&py_preconfig);
+		}
+
+		py_status = Py_PreInitialize(&py_preconfig);
+		if (PyStatus_Exception(py_status)) {
+			return ERROR(SYS_LIBRARY_ERROR, fmt::format("Failed to preinitialize Python interpreter with status [{0}]: {1}", py_status.exitcode, py_status.err_msg));
+		}
+
+		if (interpreter_config::use_isolated_config) {
+			PyConfig_InitIsolatedConfig(&py_config);
+		}
+		else {
+			PyConfig_InitPythonConfig(&py_config);
+		}
+
+		py_status = Py_InitializeFromConfig(&py_config);
+		PyConfig_Clear(&py_config);
+		if (PyStatus_Exception(py_status)) {
+			return ERROR(SYS_LIBRARY_ERROR, fmt::format("Failed to initialize Python interpreter with status [{0}]: {1}", py_status.exitcode, py_status.err_msg));
+		}
+
 		PyImport_AppendInittab("plugin_wrappers", &PyInit_plugin_wrappers);
 		PyImport_AppendInittab("irods_types", &PyInit_irods_types);
 		PyImport_AppendInittab("irods_errors", &PyInit_irods_errors);
@@ -386,58 +517,7 @@ static irods::error start(irods::default_re_ctx&, const std::string& _instance_n
 		4,
 		std::function<int(msParam_t*, msParam_t*, msParam_t*, msParam_t*, ruleExecInfo_t*)>(remote_exec_msvc));
 
-	try {
-		const auto& re_plugin_arr = irods::get_server_property<const nlohmann::json&>(
-			std::vector<std::string>{irods::KW_CFG_PLUGIN_CONFIGURATION, irods::KW_CFG_PLUGIN_TYPE_RULE_ENGINE});
-		for (const auto& plugin_config : re_plugin_arr) {
-			const auto& inst_name = plugin_config.at(irods::KW_CFG_INSTANCE_NAME).get_ref<const std::string&>();
-			if (inst_name == _instance_name) {
-				const auto& plugin_spec_cfg = plugin_config.at(irods::KW_CFG_PLUGIN_SPECIFIC_CONFIGURATION);
-
-				// TODO Enable non core.py Python rulebases
-
-				if (plugin_spec_cfg.count(irods::KW_CFG_RE_PEP_REGEX_SET)) {
-					register_regexes_from_array(plugin_spec_cfg.at(irods::KW_CFG_RE_PEP_REGEX_SET), _instance_name);
-				}
-				else {
-					RuleExistsHelper::Instance()->registerRuleRegex(STATIC_PEP_RULE_REGEX);
-					RuleExistsHelper::Instance()->registerRuleRegex(DYNAMIC_PEP_RULE_REGEX);
-
-					// clang-format off
-					log_re::debug({
-						{"rule_engine_plugin", rule_engine_name},
-						{"instance_name", _instance_name},
-						{"log_message", "No regexes found in server_config for Python RE - using default regexes"},
-						{"static_pep_rule_regex", STATIC_PEP_RULE_REGEX},
-						{"dynamic_pep_rule_regex", DYNAMIC_PEP_RULE_REGEX},
-					});
-					// clang-format on
-				}
-
-				return SUCCESS();
-			}
-		}
-	}
-	catch (const irods::exception& e) {
-		return irods::error(e);
-	}
-	catch (const boost::bad_any_cast& e) {
-		return ERROR(INVALID_ANY_CAST, e.what());
-	}
-	catch (const std::out_of_range& e) {
-		return ERROR(KEY_NOT_FOUND, e.what());
-	}
-
-	// clang-format off
-	log_re::error({
-		{"rule_engine_plugin", rule_engine_name},
-		{"instance_name", _instance_name},
-		{"log_message", "failed to find configuration for plugin"},
-	});
-	// clang-format on
-	std::stringstream msg;
-	msg << "failed to find configuration for re-python plugin [" << _instance_name << "]";
-	return ERROR(SYS_INVALID_INPUT_PARAM, msg.str());
+	return SUCCESS();
 }
 
 static irods::error stop(irods::default_re_ctx&, const std::string&)
