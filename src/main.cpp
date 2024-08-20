@@ -103,7 +103,7 @@ static std::recursive_mutex python_mutex;
 
 namespace
 {
-	const char* const rule_engine_name = "python";
+	static inline constexpr const char* const rule_engine_name = "python";
 	using log_re = irods::experimental::log::rule_engine;
 
 	namespace python_state
@@ -117,6 +117,11 @@ namespace
 		static thread_local PyThreadState* ts_thread_old;
 		// Reference counter for nested python operations
 		static thread_local uint64_t ts_thread_refct = 0;
+
+#if PY_VERSION_HEX >= 0x03080000
+		// List of default module search paths
+		static std::vector<std::wstring> default_module_search_paths;
+#endif
 	} //namespace python_state
 }
 
@@ -381,19 +386,30 @@ static irods::error start(irods::default_re_ctx&, const std::string& _instance_n
 		// lock needs to stay in scope for extract_python_exception
 		// hence the weird nesting here
 		try {
+			auto etc_irods_path = irods::get_irods_config_directory();
+
 			PyImport_AppendInittab("plugin_wrappers", &PyInit_plugin_wrappers);
 			PyImport_AppendInittab("irods_types", &PyInit_irods_types);
 			PyImport_AppendInittab("irods_errors", &PyInit_irods_errors);
+
+#if PY_VERSION_HEX >= 0x03080000
+			PyConfig py_config;
+			PyConfig_InitPythonConfig(&py_config);
+			py_config.install_signal_handlers = 0;
+			for (auto&& module_search_path : python_state::default_module_search_paths) {
+				PyWideStringList_Append(&py_config.module_search_paths, module_search_path.c_str());
+			}
+			PyWideStringList_Append(&py_config.module_search_paths, etc_irods_path.generic_wstring().c_str());
+			py_config.module_search_paths_set = 1;
+#else
 			Py_InitializeEx(0);
 #if PY_VERSION_HEX < 0x03070000
 			PyEval_InitThreads();
 #endif
-			boost::filesystem::path etc_irods_path = irods::get_irods_config_directory();
-			std::string exec_str = "import sys\nsys.path.append('" + etc_irods_path.generic_string() + "')";
-
-			bp::object main_module = bp::import("__main__");
-			bp::object main_namespace = main_module.attr("__dict__");
-			bp::exec(exec_str.c_str(), main_namespace);
+			bp:object mod_sys = bp::import("sys");
+			bp::list sys_path = bp::extract<bp::list>(mod_sys.attr("path"));
+			sys_path_list.append(bp::str(etc_irods_path.generic_string().c_str()));
+#endif
 
 			bp::object plugin_wrappers = bp::import("plugin_wrappers");
 			bp::object irods_types = bp::import("irods_types");
@@ -1014,6 +1030,34 @@ extern "C" irods::pluggable_rule_engine<irods::default_re_ctx>* plugin_factory(c
 		"exec_rule_expression",
 		std::function<irods::error(irods::default_re_ctx&, const std::string&, msParamArray_t*, irods::callback)>(
 			exec_rule_expression));
+
+#if PY_VERSION_HEX >= 0x03080000
+	Py_InitializeEx(0);
+	try {
+		bp::object mod_sys = bp::import("sys");
+		bp::list sys_path = bp::extract<bp::list>(mod_sys.attr("path"));
+		std::size_t sys_path_len = bp::extract<std::size_t>(sys_path_list.attr("__len__")());
+		python_state::default_module_search_paths.reserve(sys_path_len);
+		for (std::size_t i = 0; i < sys_path_len; ++i) {
+			python_state::default_module_search_paths.push_back(bp::extract<std::wstring>(sys_path_list[sys_path_idx]));
+		}
+	}
+	catch (const bp::error_already_set&) {
+		const std::string formatted_python_exception = extract_python_exception();
+		// clang-format off
+		log_re::error({
+			{"rule_engine_plugin", rule_engine_name},
+			{"instance_name", _inst_name},
+			{"log_message", "caught python exception"},
+			{"python_exception", formatted_python_exception},
+		});
+		// clang-format on
+		std::string err_msg = std::string("irods_rule_engine_plugin_python::") + __PRETTY_FUNCTION__ +
+		                      " Caught Python exception.\n" + formatted_python_exception;
+		return ERROR(RULE_ENGINE_ERROR, err_msg);
+	}
+	Py_Finalize(); // We're not supposed to do this, but let's try it anyway.
+#endif
 
 	return re;
 }
