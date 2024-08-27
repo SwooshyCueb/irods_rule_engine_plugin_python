@@ -11,7 +11,6 @@
 #include <vector>
 #include <map>
 #include <memory>
-#include <mutex>
 
 #include <boost/version.hpp>
 #pragma GCC diagnostic push
