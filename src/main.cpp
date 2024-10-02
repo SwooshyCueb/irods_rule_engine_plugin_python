@@ -4,24 +4,29 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <codecvt>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <list>
+#include <locale>
 #include <string>
 #include <vector>
 #include <map>
 #include <memory>
+#include <optional>
 
 #include <boost/version.hpp>
 #pragma GCC diagnostic push
 #if BOOST_VERSION < 108100
 #  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
+#include <boost/config.hpp>
 #include <boost/date_time.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
-#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem.hpp>
 #pragma GCC diagnostic pop
 
 #include <irods/rodsErrorTable.h>
@@ -90,72 +95,776 @@ static int remote_exec_msvc(msParam_t* _pd, msParam_t* _pa, msParam_t* _pb, msPa
 	return rsExecMyRule(_rei->rsComm, &exec_inp, &out_arr);
 } // remote_exec_msvc
 
-const std::string ELEMENT_TYPE = "ELEMENT_TYPE";
-const std::string STRING_TYPE = "STRING_TYPE";
-const std::string STRING_VALUE_KEY = "STRING_VALUE_KEY";
-const std::string IRODS_ERROR_PREFIX = "[iRods__Error__Code:";
-
-const std::string STATIC_PEP_RULE_REGEX = "ac[^ ]*";
-const std::string DYNAMIC_PEP_RULE_REGEX = "[^ ]*pep_[^ ]*_(pre|post)";
-
 namespace bp = boost::python;
+namespace sfs = std::filesystem;
+namespace bfs = boost:filesystem;
 
 namespace
 {
-	static inline constexpr const char* const rule_engine_name = "python";
+	static BOOST_FORCEINLINE constexpr const char* const rule_engine_name = "python";
+
 	using log_re = irods::experimental::log::rule_engine;
+
+	const std::string ELEMENT_TYPE = "ELEMENT_TYPE";
+	const std::string STRING_TYPE = "STRING_TYPE";
+	const std::string STRING_VALUE_KEY = "STRING_VALUE_KEY";
+	const std::string IRODS_ERROR_PREFIX = "[iRods__Error__Code:";
+
+	const std::string STATIC_PEP_RULE_REGEX = "ac[^ ]*";
+	const std::string DYNAMIC_PEP_RULE_REGEX = "[^ ]*pep_[^ ]*_(pre|post)";
+
+#if PY_VERSION_HEX >= 0x03080000
+	using pypath_string = std::wstring;
+	// Python uses a lot of wchar_t-based strings.
+	// Python provides PyConfig_SetBytesString for converting from char-based strings
+	// but it is locale-dependant. Instead, we handle it ourselves.
+
+	// (w)string converter for non-paths
+	// NOTE: codecvt is deprecated,
+	//       but stdlib has no replacement for it in C++20
+	//       and we don't want a direct dependency on boost.locale
+	// https://stackoverflow.com/a/18597384/6278710
+	const std::wstring_convert<std::codecvt_utf8<wchar_t>> wstring_converter;
+
+	static BOOST_FORCEINLINE pypath_string& get_pypath_string(const sfs::path& path) { return path.generic_wstring(); }
+	static BOOST_FORCEINLINE pypath_string& get_pypath_string(const bfs::path& path) { return path.generic_wstring(); }
+#else
+	using pypath_string = std::string;
+
+	static BOOST_FORCEINLINE pypath_string& get_pypath_string(const sfs::path& path) { return path.generic_string(); }
+	static BOOST_FORCEINLINE pypath_string& get_pypath_string(const bfs::path& path) { return path.generic_string(); }
+#endif
+
+	static BOOST_FORCEINLINE pypath_string& get_pypath_string(const std::string& path)
+	{
+		if (path == "$IRODS_CONFIG_DIRECTORY$") {
+			return get_pypath_string(irods::get_irods_config_directory());
+		}
+		return get_pypath_string(sfs::path{path});
+	}
 
 	// Data we hang onto for the interpreter
 	namespace python_state
 	{
 		// Thread state object for main Python interpreter
-		static PyThreadState* ts_main;
+		PyThreadState* ts_main;
 
 #if PY_VERSION_HEX >= 0x03080000
 		// List of default module search paths
-		static std::vector<std::wstring> default_module_search_paths;
+		std::vector<std::wstring> default_module_search_paths;
 		// Whether or not default_module_search_paths is populated
-		static bool default_module_search_paths_set = false;
+		bool default_module_search_paths_set = false;
 #endif
 	} //namespace python_state
-}
 
-void register_regexes_from_array(const nlohmann::json& _array, const std::string& _instance_name)
-{
-	try {
-		for (const auto& elem : _array) {
-			try {
-				const auto& tmp = elem.get_ref<const std::string&>();
-				RuleExistsHelper::Instance()->registerRuleRegex(tmp);
-				// clang-format off
-				log_re::debug({
-					{"rule_engine_plugin", rule_engine_name},
-					{"instance_name", _instance_name},
-					{"regex", tmp},
-				});
-				// clang-format on
-			}
-			catch (const boost::bad_any_cast&) {
-				// clang-format off
-				log_re::error({
-					{"rule_engine_plugin", rule_engine_name},
-					{"instance_name", _instance_name},
-					{"log_message", "failed to cast pep_regex_to_match to string"},
-				});
-				// clang-format on
-				continue;
+	namespace plugin_configuration
+	{
+		namespace defaults
+		{
+			const std::vector<const std::string> re_pep_regex_set{STATIC_PEP_RULE_REGEX, DYNAMIC_PEP_RULE_REGEX};
+
+			namespace interpreter
+			{
+#if PY_VERSION_HEX >= 0x03080000
+				const int isolated = 1;
+
+				const int dev_mode = 0;
+				const int use_environment = 0;
+				const int utf8_mode = 1;
+				const int verbose = 0;
+				const std::optional<unsigned long> hash_seed = std::nullopt;
+#if PY_VERSION_HEX >= 0x030C0000
+				const std::optional<int> int_max_str_digits = std::nullopt;
+				const int perf_profiling = 0;
+#endif
+				const std::optional<std::vector<std::wstring>> xoptions = std::nullopt;
+
+				const std::optional<int> configure_locale = std::nullopt;
+				const std::optional<int> coerce_c_locale = std::nullopt;
+				const std::optional<int> coerce_c_locale_warn = std::nullopt;
+
+				const std::optional<int> site_import = std::nullopt;
+				const int user_site_directory = 0; // irods user probably doesn't have a proper home directory
+
+				const std::optional<int> optimization_level = std::nullopt;
+				const std::optional<int> write_bytecode = std::nullopt;
+				const std::optional<pypath_string> pycache_prefix = std::nullopt;
+				const std::optional<std::wstring> check_hash_pycs_mode = std::nullopt;
+
+				const std::optional<pypath_string> base_prefix = std::nullopt;
+				const std::optional<pypath_string> prefix = std::nullopt;
+				const std::optional<pypath_string> base_exec_prefix = std::nullopt;
+				const std::optional<pypath_string> exec_prefix = std::nullopt;
+				const std::optional<pypath_string> base_executable = std::nullopt;
+				const std::optional<pypath_string> executable = std::nullopt;
+
+				const std::optional<std::wstring> filesystem_encoding = std::nullopt;
+				const std::optional<std::wstring> filesystem_errors = std::nullopt;
+
+				const std::optional<std::wstring> stdio_encoding = std::nullopt;
+				const std::optional<std::wstring> stdio_errors = std::nullopt;
+
+				const std::optional<int> buffered_stdio = std::nullopt;
+				const std::optional<int> configure_c_stdio = std::nullopt;
+
+				const std::optional<int> bytes_warning = std::nullopt;
+				const std::optional<int> pathconfig_warnings = std::nullopt;
+#if PY_VERSION_HEX >= 0x030A0000
+				const std::optional<int> warn_default_encoding = std::nullopt;
+#endif
+				const std::optional<std::vector<std::wstring>> warnoptions = std::nullopt;
+
+#ifdef Py_DEBUG
+				const int parser_debug = 0;
+#endif
+				const int tracemalloc = 0;
+				const int import_time = 0;
+
+				const std::optional<std::vector<pypath_string>> module_search_paths = std::nullopt;
+#endif
+
+				namespace additional_module_search_paths
+				{
+					const std::optional<std::vector<pypath_string>> prepend = std::nullopt;
+					const std::optional<std::vector<pypath_string>> append = std::nullopt;
+				} //namespace additional_module_search_paths
+			} //namespace interpreter
+		} //namespace defaults
+
+		std::vector<const std::string> re_pep_regex_set{defaults::re_pep_regex_set};
+
+		namespace interpreter
+		{
+#if PY_VERSION_HEX >= 0x03080000
+			// Whether the interpreter is configured in isolated mode.
+			// If 0, interpreter configuration is intialized with
+			// 	PyPreConfig_InitPythonConfig and PyConfig_InitPythonConfig
+			// Otherwise, interpreter configuration is intialized with
+			// 	PyPreConfig_InitIsolatedConfig and PyConfig_InitIsolatedConfig
+			// https://docs.python.org/3/c-api/init_config.html#isolated-configuration
+			int isolated = defaults::interpreter::isolated;
+
+			// https://docs.python.org/3/c-api/init_config.html#c.PyPreConfig.dev_mode
+			int dev_mode = defaults::interpreter::dev_mode;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyPreConfig.use_environment
+			int use_environment = defaults::interpreter::use_environment;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyPreConfig.utf8_mode
+			int utf8_mode = defaults::interpreter::utf8_mode;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.verbose
+			int verbose = defaults::interpreter::verbose;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.hash_seed
+			std::optional<unsigned long> hash_seed = defaults::interpreter::hash_seed;
+#if PY_VERSION_HEX >= 0x030C0000
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.int_max_str_digits
+			std::optional<int> int_max_str_digits = defaults::interpreter::int_max_str_digits;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.perf_profiling
+			int perf_profiling = defaults::interpreter::perf_profiling;
+#endif
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.xoptions
+			std::optional<std::vector<std::wstring>> xoptions = defaults::interpreter::xoptions;
+
+			// https://docs.python.org/3/c-api/init_config.html#c.PyPreConfig.configure_locale
+			std::optional<int> configure_locale = defaults::interpreter::configure_locale;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyPreConfig.coerce_c_locale
+			std::optional<int> coerce_c_locale = defaults::interpreter::coerce_c_locale;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyPreConfig.coerce_c_locale_warn
+			std::optional<int> coerce_c_locale_warn = defaults::interpreter::coerce_c_locale_warn;
+
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.site_import
+			std::optional<int> site_import = defaults::interpreter::site_import;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.user_site_directory
+			int user_site_directory = defaults::interpreter::user_site_directory;
+
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.optimization_level
+			std::optional<int> optimization_level = defaults::interpreter::optimization_level;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.write_bytecode
+			std::optional<int> write_bytecode = defaults::interpreter::write_bytecode;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.pycache_prefix
+			std::optional<std::wstring> pycache_prefix = defaults::interpreter::pycache_prefix;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.check_hash_pycs_mode
+			std::wstring check_hash_pycs_mode = defaults::interpreter::check_hash_pycs_mode;
+
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.base_prefix
+			std::optional<std::wstring> base_prefix = defaults::interpreter::base_prefix;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.prefix
+			std::optional<std::wstring> prefix = defaults::interpreter::prefix;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.base_exec_prefix
+			std::optional<std::wstring> base_exec_prefix = defaults::interpreter::base_exec_prefix;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.exec_prefix
+			std::optional<std::wstring> exec_prefix = defaults::interpreter::exec_prefix;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.base_executable
+			std::optional<std::wstring> base_executable = defaults::interpreter::base_executable;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.executable
+			std::optional<std::wstring> executable = defaults::interpreter::executable;
+
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.filesystem_encoding
+			std::optional<std::wstring> filesystem_encoding = defaults::interpreter::filesystem_encoding;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.filesystem_errors
+			std::optional<std::wstring> filesystem_errors = defaults::interpreter::filesystem_errors;
+
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.stdio_encoding
+			std::optional<std::wstring> stdio_encoding = defaults::interpreter::stdio_encoding;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.stdio_errors
+			std::optional<std::wstring> stdio_errors = defaults::interpreter::stdio_errors;
+
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.buffered_stdio
+			std::optional<int> buffered_stdio = defaults::interpreter::buffered_stdio;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.configure_c_stdio
+			std::optional<int> configure_c_stdio = defaults::interpreter::configure_c_stdio;
+
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.bytes_warning
+			std::optional<int> bytes_warning = defaults::interpreter::bytes_warning;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.pathconfig_warnings
+			std::optional<int> pathconfig_warnings = defaults::interpreter::pathconfig_warnings;
+#if PY_VERSION_HEX >= 0x030A0000
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.warn_default_encoding
+			std::optional<int> warn_default_encoding = defaults::interpreter::warn_default_encoding;
+#endif
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.warnoptions
+			std::optional<std::vector<std::wstring>> warnoptions = defaults::interpreter::warnoptions;
+
+#ifdef Py_DEBUG
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.parser_debug
+			int parser_debug = defaults::interpreter::parser_debug;
+#endif
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.tracemalloc
+			int tracemalloc = defaults::interpreter::tracemalloc;
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.import_time
+			int import_time = defaults::interpreter::import_time;
+
+			// Replaces the entire list of module search paths
+			// https://docs.python.org/3/c-api/init_config.html#c.PyConfig.module_search_paths
+			std::optional<std::vector<std::wstring>> module_search_paths = defaults::interpreter::module_search_paths;
+#endif
+
+			// alternative to module_search_paths; for prepending and appending to default module search path list
+			// this is the only interpreter configuration supported for Python <3.8
+			// if one is specified, both must be specified
+			// cannot be specified with module_search_paths
+			namespace additional_module_search_paths
+			{
+				std::optional<std::vector<pypath_string>> prepend = defaults::interpreter::additional_module_search_paths::prepend;
+				std::optional<std::vector<pypath_string>> append = defaults::interpreter::additional_module_search_paths::append;
+			} //namespace additional_module_search_paths
+		} //namespace interpreter
+	} // namespace plugin_configuration
+
+	static BOOST_FORCEINLINE void set_default_interpreter_configs()
+	{
+#if PY_VERSION_HEX >= 0x03080000
+			plugin_configuration::interpreter::isolated = plugin_configuration::defaults::interpreter::isolated;
+			plugin_configuration::interpreter::dev_mode = plugin_configuration::defaults::interpreter::dev_mode;
+			plugin_configuration::interpreter::use_environment = plugin_configuration::defaults::interpreter::use_environment;
+			plugin_configuration::interpreter::utf8_mode = plugin_configuration::defaults::interpreter::utf8_mode;
+			plugin_configuration::interpreter::verbose = plugin_configuration::defaults::interpreter::verbose;
+			plugin_configuration::interpreter::hash_seed = plugin_configuration::defaults::interpreter::hash_seed;
+#if PY_VERSION_HEX >= 0x030C0000
+			plugin_configuration::interpreter::int_max_str_digits = plugin_configuration::defaults::interpreter::int_max_str_digits;
+			plugin_configuration::interpreter::perf_profiling = plugin_configuration::defaults::interpreter::perf_profiling;
+#endif
+			plugin_configuration::interpreter::xoptions = plugin_configuration::defaults::interpreter::xoptions;
+			plugin_configuration::interpreter::configure_locale = plugin_configuration::defaults::interpreter::configure_locale;
+			plugin_configuration::interpreter::coerce_c_locale = plugin_configuration::defaults::interpreter::coerce_c_locale;
+			plugin_configuration::interpreter::coerce_c_locale_warn = plugin_configuration::defaults::interpreter::coerce_c_locale_warn;
+			plugin_configuration::interpreter::site_import = plugin_configuration::defaults::interpreter::site_import;
+			plugin_configuration::interpreter::user_site_directory = plugin_configuration::defaults::interpreter::user_site_directory;
+			plugin_configuration::interpreter::optimization_level = plugin_configuration::defaults::interpreter::optimization_level;
+			plugin_configuration::interpreter::write_bytecode = plugin_configuration::defaults::interpreter::write_bytecode;
+			plugin_configuration::interpreter::pycache_prefix = plugin_configuration::defaults::interpreter::pycache_prefix;
+			plugin_configuration::interpreter::check_hash_pycs_mode = plugin_configuration::defaults::interpreter::check_hash_pycs_mode;
+			plugin_configuration::interpreter::exec_prefix = plugin_configuration::defaults::interpreter::exec_prefix;
+			plugin_configuration::interpreter::prefix = plugin_configuration::defaults::interpreter::prefix;
+			plugin_configuration::interpreter::module_search_paths = plugin_configuration::defaults::interpreter::module_search_paths;
+			plugin_configuration::interpreter::filesystem_encoding = plugin_configuration::defaults::interpreter::filesystem_encoding;
+			plugin_configuration::interpreter::filesystem_errors = plugin_configuration::defaults::interpreter::filesystem_errors;
+			plugin_configuration::interpreter::stdio_encoding = plugin_configuration::defaults::interpreter::stdio_encoding;
+			plugin_configuration::interpreter::stdio_errors = plugin_configuration::defaults::interpreter::stdio_errors;
+			plugin_configuration::interpreter::buffered_stdio = plugin_configuration::defaults::interpreter::buffered_stdio;
+			plugin_configuration::interpreter::configure_c_stdio = plugin_configuration::defaults::interpreter::configure_c_stdio;
+			plugin_configuration::interpreter::bytes_warning = plugin_configuration::defaults::interpreter::bytes_warning;
+			plugin_configuration::interpreter::pathconfig_warnings = plugin_configuration::defaults::interpreter::pathconfig_warnings;
+#if PY_VERSION_HEX >= 0x030A0000
+			plugin_configuration::interpreter::warn_default_encoding = plugin_configuration::defaults::interpreter::warn_default_encoding;
+#endif
+			plugin_configuration::interpreter::warnoptions = plugin_configuration::defaults::interpreter::warnoptions;
+#ifdef Py_DEBUG
+			plugin_configuration::interpreter::parser_debug = plugin_configuration::defaults::interpreter::parser_debug;
+#endif
+			plugin_configuration::interpreter::tracemalloc = plugin_configuration::defaults::interpreter::tracemalloc;
+			plugin_configuration::interpreter::import_time = plugin_configuration::defaults::interpreter::import_time;
+#endif
+			plugin_configuration::interpreter::additional_module_search_paths::prepend = plugin_configuration::defaults::interpreter::additional_module_search_paths::prepend;
+			plugin_configuration::interpreter::additional_module_search_paths::append = plugin_configuration::defaults::interpreter::additional_module_search_paths::append;
+	}
+
+	static BOOST_FORCEINLINE irods::error get_re_configs(const std::string& _instance_name)
+	{
+		try {
+			const auto& re_plugin_arr = irods::get_server_property<const nlohmann::json&>(
+				std::vector<std::string>{irods::KW_CFG_PLUGIN_CONFIGURATION, irods::KW_CFG_PLUGIN_TYPE_RULE_ENGINE});
+			for (const auto& plugin_config : re_plugin_arr) {
+				const auto& inst_name = plugin_config.at(irods::KW_CFG_INSTANCE_NAME).get_ref<const std::string&>();
+				if (inst_name != _instance_name) {
+					continue;
+				}
+
+				const auto& plugin_spec_cfg = plugin_config.at(irods::KW_CFG_PLUGIN_SPECIFIC_CONFIGURATION);
+
+				// TODO(#226): Enable non core.py Python rulebases
+
+				re_pep_regex_set_iter = plugin_spec_cfg.find(irods::KW_CFG_RE_PEP_REGEX_SET);
+				if (re_pep_regex_set_iter == plugin_spec_cfg.end()) {
+					plugin_configuration::re_pep_regex_set = plugin_configuration::defaults::re_pep_regex_set;
+					// clang-format off
+					log_re::debug({
+						{"rule_engine_plugin", rule_engine_name},
+						{"instance_name", _instance_name},
+						{"log_message", "No regexes found in server_config for Python RE - using default regexes"}
+					});
+					// clang-format on
+				}
+				else {
+					const auto& re_pep_regex_set_cfg = re_pep_regex_set_iter.get_ref<const nlohmann::json&>();
+					plugin_configuration::re_pep_regex_set.clear();
+					for (const auto& re_pep_regex_cfg : re_pep_regex_set_cfg) {
+						const auto& re_pep_regex = re_pep_regex_cfg.get_ref<const std::string&>();
+						plugin_configuration::re_pep_regex_set.push_back(re_pep_regex);
+						// clang-format off
+						log_re::debug({
+							{"rule_engine_plugin", rule_engine_name},
+							{"instance_name", _instance_name},
+							{"regex", re_pep_regex},
+						});
+						// clang-format on
+					}
+				}
+
+				const auto interpreter_iter = plugin_spec_cfg.find("interpreter");
+				if (interpreter_iter == plugin_spec_cfg.end()) {
+					set_default_interpreter_configs();
+					log_re::debug({
+						{"rule_engine_plugin", rule_engine_name},
+						{"instance_name", _instance_name},
+						{"message", "using default interpreter configuration"},
+					});
+				}
+				else {
+					const auto& interpreter_cfg = interpreter_iter.get_ref<const nlohmann::json&>();
+
+					const auto additional_module_search_paths_iter = interpreter_cfg.find("additional_module_search_paths");
+					if (additional_module_search_paths_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::additional_module_search_paths::prepend = plugin_configuration::defaults::interpreter::additional_module_search_paths::prepend;
+						plugin_configuration::interpreter::additional_module_search_paths::append = plugin_configuration::defaults::interpreter::additional_module_search_paths::append;
+					}
+					else {
+						const auto& additional_module_search_paths_cfg = additional_module_search_paths_iter.get_ref<const nlohmann::json&>();
+
+						const auto prepend_paths_iter = additional_module_search_paths_cfg.find("prepend");
+						if (prepend_paths_iter == additional_module_search_paths_cfg.end()) {
+							plugin_configuration::interpreter::additional_module_search_paths::prepend = plugin_configuration::defaults::interpreter::additional_module_search_paths::prepend;
+						}
+						else {
+							const auto& prepend_paths_cfg = prepend_paths_iter.get_ref<const nlohmann::json&>();
+							std::vector<std::wstring> prepend;
+							for (const auto& prepend_path_iter : prepend_paths_cfg) {
+								const auto& prepend_path = prepend_path_iter.get_ref<const std::string&>();
+								prepend.push_back(get_pypath_string(prepend_path));
+							}
+							plugin_configuration::interpreter::additional_module_search_paths::prepend = prepend;
+						}
+						
+						const auto append_paths_iter = additional_module_search_paths_cfg.find("append");
+						if (append_paths_iter == additional_module_search_paths_cfg.end()) {
+							plugin_configuration::interpreter::additional_module_search_paths::append = plugin_configuration::defaults::interpreter::additional_module_search_paths::append;
+						}
+						else {
+							const auto& append_paths_cfg = append_paths_iter.get_ref<const nlohmann::json&>();
+							std::vector<std::wstring> append;
+							for (const auto& append_path_iter : append_paths_cfg) {
+								const auto& append_path = append_path_iter.get_ref<const std::string&>();
+								append.push_back(get_pypath_string(append_path));
+							}
+							plugin_configuration::interpreter::additional_module_search_paths::append = append;
+						}
+					}
+
+					if (plugin_configuration::interpreter::additional_module_search_paths::prepend.has_value() !=
+						plugin_configuration::interpreter::additional_module_search_paths::append.has_value()) {
+						// clang-format off
+						log_re::error({
+							{"rule_engine_plugin", rule_engine_name},
+							{"instance_name", _instance_name},
+							{"message", "Configuration error: only one of additional_module_search_paths defined"},
+						});
+						// clang-format on
+						auto msg = fmt::format("only one of additional_module_search_paths defined for re-python plugin [{}]", _instance_name);
+						return ERROR(SYS_INVALID_INPUT_PARAM, msg);
+					}
+
+#if PY_VERSION_HEX < 0x03080000
+					// clang-format off
+					log_re::warning({
+						{"rule_engine_plugin", rule_engine_name},
+						{"instance_name", _instance_name},
+						{"message", "interpreter configuration found, but Python version does not support PyConfig; most interpreter configuration options will be ignored"},
+					});
+					// clang-format on
+#else
+
+					const auto isolated_iter = interpreter_cfg.find("isolated");
+					if (isolated_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::isolated = plugin_configuration::defaults::interpreter::isolated;
+					}
+					else {
+						plugin_configuration::interpreter::isolated = isolated_iter.get<int>();
+					}
+
+					const auto dev_mode_iter = interpreter_cfg.find("dev_mode");
+					if (dev_mode_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::dev_mode = plugin_configuration::defaults::interpreter::dev_mode;
+					}
+					else {
+						plugin_configuration::interpreter::dev_mode = dev_mode_iter.get<int>();
+					}
+
+					const auto use_environment_iter = interpreter_cfg.find("use_environment");
+					if (use_environment_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::use_environment = plugin_configuration::defaults::interpreter::use_environment;
+					}
+					else {
+						plugin_configuration::interpreter::use_environment = use_environment_iter.get<int>();
+					}
+
+					const auto utf8_mode_iter = interpreter_cfg.find("utf8_mode");
+					if (utf8_mode_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::utf8_mode = plugin_configuration::defaults::interpreter::utf8_mode;
+					}
+					else {
+						plugin_configuration::interpreter::utf8_mode = utf8_mode_iter.get<int>();
+					}
+
+					const auto verbose_iter = interpreter_cfg.find("verbose");
+					if (verbose_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::verbose = plugin_configuration::defaults::interpreter::verbose;
+					}
+					else {
+						plugin_configuration::interpreter::verbose = verbose_iter.get<int>();
+					}
+
+					const auto hash_seed_iter = interpreter_cfg.find("hash_seed");
+					if (hash_seed_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::hash_seed = plugin_configuration::defaults::interpreter::hash_seed;
+					}
+					else {
+						plugin_configuration::interpreter::hash_seed = hash_seed_iter.get<unsigned long>();
+					}
+
+#if PY_VERSION_HEX >= 0x030C0000
+					const auto int_max_str_digits_iter = interpreter_cfg.find("int_max_str_digits");
+					if (int_max_str_digits_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::int_max_str_digits = plugin_configuration::defaults::interpreter::int_max_str_digits;
+					}
+					else {
+						plugin_configuration::interpreter::int_max_str_digits = int_max_str_digits_iter.get<int>();
+					}
+
+					const auto perf_profiling_iter = interpreter_cfg.find("perf_profiling");
+					if (perf_profiling_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::perf_profiling = plugin_configuration::defaults::interpreter::perf_profiling;
+					}
+					else {
+						plugin_configuration::interpreter::perf_profiling = perf_profiling_iter.get<int>();
+					}
+#endif
+
+					const auto xoptions_iter = interpreter_cfg.find("xoptions");
+					if (xoptions_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::xoptions = plugin_configuration::defaults::interpreter::xoptions;
+					}
+					else {
+						const auto& xoptions_cfg = xoptions_iter.get_ref<const nlohmann::json&>();
+						std::vector<std::wstring> xoptions;
+						for (const auto& xoption_iter : xoptions_cfg) {
+							const auto& xoption = xoption_iter.get_ref<const std::string&>();
+							xoptions.push_back(wstring_converter.from_bytes(xoption));
+						}
+						plugin_configuration::interpreter::xoptions = xoptions;
+					}
+
+					const auto configure_locale_iter = interpreter_cfg.find("configure_locale");
+					if (configure_locale_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::configure_locale = plugin_configuration::defaults::interpreter::configure_locale;
+					}
+					else {
+						plugin_configuration::interpreter::configure_locale = configure_locale_iter.get<int>();
+					}
+
+					const auto coerce_c_locale_iter = interpreter_cfg.find("coerce_c_locale");
+					if (coerce_c_locale_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::coerce_c_locale = plugin_configuration::defaults::interpreter::coerce_c_locale;
+					}
+					else {
+						plugin_configuration::interpreter::coerce_c_locale = coerce_c_locale_iter.get<int>();
+					}
+
+					const auto coerce_c_locale_warn_iter = interpreter_cfg.find("coerce_c_locale_warn");
+					if (coerce_c_locale_warn_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::coerce_c_locale_warn = plugin_configuration::defaults::interpreter::coerce_c_locale_warn;
+					}
+					else {
+						plugin_configuration::interpreter::coerce_c_locale_warn = coerce_c_locale_warn_iter.get<int>();
+					}
+
+					const auto site_import_iter = interpreter_cfg.find("site_import");
+					if (site_import_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::site_import = plugin_configuration::defaults::interpreter::site_import;
+					}
+					else {
+						plugin_configuration::interpreter::site_import = site_import_iter.get<int>();
+					}
+
+					const auto user_site_directory_iter = interpreter_cfg.find("user_site_directory");
+					if (user_site_directory_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::user_site_directory = plugin_configuration::defaults::interpreter::user_site_directory;
+					}
+					else {
+						plugin_configuration::interpreter::user_site_directory = user_site_directory_iter.get<int>();
+					}
+
+					const auto optimization_level_iter = interpreter_cfg.find("optimization_level");
+					if (optimization_level_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::optimization_level = plugin_configuration::defaults::interpreter::optimization_level;
+					}
+					else {
+						plugin_configuration::interpreter::optimization_level = optimization_level_iter.get<int>();
+					}
+
+					const auto write_bytecode_iter = interpreter_cfg.find("write_bytecode");
+					if (write_bytecode_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::write_bytecode = plugin_configuration::defaults::interpreter::write_bytecode;
+					}
+					else {
+						plugin_configuration::interpreter::write_bytecode = write_bytecode_iter.get<int>();
+					}
+
+					const auto pycache_prefix_iter = interpreter_cfg.find("pycache_prefix");
+					if (pycache_prefix_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::pycache_prefix = plugin_configuration::defaults::interpreter::pycache_prefix;
+					}
+					else {
+						const auto& pycache_prefix = pycache_prefix_iter.get_ref<const std::string&>();
+						plugin_configuration::interpreter::pycache_prefix = get_pypath_string(pycache_prefix);
+					}
+
+					const auto check_hash_pycs_mode_iter = interpreter_cfg.find("check_hash_pycs_mode");
+					if (check_hash_pycs_mode_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::check_hash_pycs_mode = plugin_configuration::defaults::interpreter::check_hash_pycs_mode;
+					}
+					else {
+						const auto& check_hash_pycs_mode = check_hash_pycs_mode_iter.get_ref<const std::string&>();
+						plugin_configuration::interpreter::check_hash_pycs_mode = wstring_converter.from_bytes(check_hash_pycs_mode);
+					}
+
+					const auto exec_prefix_iter = interpreter_cfg.find("exec_prefix");
+					if (exec_prefix_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::exec_prefix = plugin_configuration::defaults::interpreter::exec_prefix;
+					}
+					else {
+						const auto& exec_prefix = exec_prefix_iter.get_ref<const std::string&>();
+						plugin_configuration::interpreter::exec_prefix = get_pypath_string(exec_prefix);
+					}
+
+					const auto prefix_iter = interpreter_cfg.find("prefix");
+					if (prefix_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::prefix = plugin_configuration::defaults::interpreter::prefix;
+					}
+					else {
+						const auto& prefix = prefix_iter.get_ref<const std::string&>();
+						plugin_configuration::interpreter::prefix = get_pypath_string(prefix);
+					}
+
+					const auto filesystem_encoding_iter = interpreter_cfg.find("filesystem_encoding");
+					if (filesystem_encoding_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::filesystem_encoding = plugin_configuration::defaults::interpreter::filesystem_encoding;
+					}
+					else {
+						const auto& filesystem_encoding = filesystem_encoding_iter.get_ref<const std::string&>();
+						plugin_configuration::interpreter::filesystem_encoding = wstring_converter.from_bytes(filesystem_encoding);
+					}
+
+					const auto filesystem_errors_iter = interpreter_cfg.find("filesystem_errors");
+					if (filesystem_errors_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::filesystem_errors = plugin_configuration::defaults::interpreter::filesystem_errors;
+					}
+					else {
+						const auto& filesystem_errors = filesystem_errors_iter.get_ref<const std::string&>();
+						plugin_configuration::interpreter::filesystem_errors = wstring_converter.from_bytes(filesystem_errors);
+					}
+
+					const auto stdio_encoding_iter = interpreter_cfg.find("stdio_encoding");
+					if (stdio_encoding_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::stdio_encoding = plugin_configuration::defaults::interpreter::stdio_encoding;
+					}
+					else {
+						const auto& stdio_encoding = stdio_encoding_iter.get_ref<const std::string&>();
+						plugin_configuration::interpreter::stdio_encoding = wstring_converter.from_bytes(stdio_encoding);
+					}
+
+					const auto stdio_errors_iter = interpreter_cfg.find("stdio_errors");
+					if (stdio_errors_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::stdio_errors = plugin_configuration::defaults::interpreter::stdio_errors;
+					}
+					else {
+						const auto& stdio_errors = stdio_errors_iter.get_ref<const std::string&>();
+						plugin_configuration::interpreter::stdio_errors = wstring_converter.from_bytes(stdio_errors);
+					}
+
+					const auto buffered_stdio_iter = interpreter_cfg.find("buffered_stdio");
+					if (buffered_stdio_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::buffered_stdio = plugin_configuration::defaults::interpreter::buffered_stdio;
+					}
+					else {
+						plugin_configuration::interpreter::buffered_stdio = buffered_stdio_iter.get<int>();
+					}
+
+					const auto configure_c_stdio_iter = interpreter_cfg.find("configure_c_stdio");
+					if (configure_c_stdio_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::configure_c_stdio = plugin_configuration::defaults::interpreter::configure_c_stdio;
+					}
+					else {
+						plugin_configuration::interpreter::configure_c_stdio = configure_c_stdio_iter.get<int>();
+					}
+
+					const auto bytes_warning_iter = interpreter_cfg.find("bytes_warning");
+					if (bytes_warning_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::bytes_warning = plugin_configuration::defaults::interpreter::bytes_warning;
+					}
+					else {
+						plugin_configuration::interpreter::bytes_warning = bytes_warning_iter.get<int>();
+					}
+
+					const auto pathconfig_warnings_iter = interpreter_cfg.find("pathconfig_warnings");
+					if (pathconfig_warnings_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::pathconfig_warnings = plugin_configuration::defaults::interpreter::pathconfig_warnings;
+					}
+					else {
+						plugin_configuration::interpreter::pathconfig_warnings = pathconfig_warnings_iter.get<int>();
+					}
+
+#if PY_VERSION_HEX >= 0x030A0000
+					const auto warn_default_encoding_iter = interpreter_cfg.find("warn_default_encoding");
+					if (warn_default_encoding_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::warn_default_encoding = plugin_configuration::defaults::interpreter::warn_default_encoding;
+					}
+					else {
+						plugin_configuration::interpreter::warn_default_encoding = warn_default_encoding_iter.get<int>();
+					}
+#endif
+
+					const auto warnoptions_iter = interpreter_cfg.find("warnoptions");
+					if (warnoptions_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::warnoptions = plugin_configuration::defaults::interpreter::warnoptions;
+					}
+					else {
+						const auto& warnoptions_cfg = warnoptions_iter.get_ref<const nlohmann::json&>();
+						std::vector<std::wstring> warnoptions;
+						for (const auto& warnoption_iter : warnoptions_cfg) {
+							const auto& warnoption = warnoption_iter.get_ref<const std::string&>();
+							warnoptions.push_back(wstring_converter.from_bytes(warnoption));
+						}
+						plugin_configuration::interpreter::warnoptions = warnoptions;
+					}
+
+#ifdef Py_DEBUG
+					const auto parser_debug_iter = interpreter_cfg.find("parser_debug");
+					if (parser_debug_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::parser_debug = plugin_configuration::defaults::interpreter::parser_debug;
+					}
+					else {
+						plugin_configuration::interpreter::parser_debug = parser_debug_iter.get<int>();
+					}
+#endif
+
+					const auto tracemalloc_iter = interpreter_cfg.find("tracemalloc");
+					if (tracemalloc_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::tracemalloc = plugin_configuration::defaults::interpreter::tracemalloc;
+					}
+					else {
+						plugin_configuration::interpreter::tracemalloc = tracemalloc_iter.get<int>();
+					}
+
+					const auto import_time_iter = interpreter_cfg.find("import_time");
+					if (import_time_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::import_time = plugin_configuration::defaults::interpreter::import_time;
+					}
+					else {
+						plugin_configuration::interpreter::import_time = import_time_iter.get<int>();
+					}
+
+					const auto module_search_paths_iter = interpreter_cfg.find("module_search_paths");
+					if (module_search_paths_iter == interpreter_cfg.end()) {
+						plugin_configuration::interpreter::module_search_paths = plugin_configuration::defaults::interpreter::module_search_paths;
+					}
+					else {
+						const auto& module_search_paths_cfg = module_search_paths_iter.get_ref<const nlohmann::json&>();
+						std::vector<std::wstring> module_search_paths;
+						for (const auto& module_search_path_iter : module_search_paths_cfg) {
+							const auto& module_search_path = module_search_path_iter.get_ref<const std::string&>();
+							module_search_paths.push_back(get_pypath_string(module_search_path));
+						}
+						plugin_configuration::interpreter::module_search_paths = module_search_paths;
+					}
+
+					if (plugin_configuration::interpreter::module_search_paths.has_value()) {
+						if (plugin_configuration::interpreter::additional_module_search_paths::prepend.has_value() ||
+							plugin_configuration::interpreter::additional_module_search_paths::append.has_value()) {
+							// clang-format off
+							log_re::error({
+								{"rule_engine_plugin", rule_engine_name},
+								{"instance_name", _instance_name},
+								{"message", "Configuration error: both module_search_paths and additional_module_search_paths defined"},
+							});
+							// clang-format on
+							auto msg = fmt::format("both module_search_paths and additional_module_search_paths defined for re-python plugin [{}]", _instance_name);
+							return ERROR(SYS_INVALID_INPUT_PARAM, msg);
+						}
+					}
+#endif
+				}
+				return SUCCESS();
 			}
 		}
-	}
-	catch (const boost::bad_any_cast&) {
-		std::stringstream msg;
-		msg << "[" << _instance_name << "] failed to any_cast a std::vector<boost::any>&";
-		THROW(INVALID_ANY_CAST, msg.str());
-	}
-}
+		catch (const irods::exception& e) {
+			return irods::error(e);
+		}
+		catch (const boost::bad_any_cast& e) {
+			return ERROR(INVALID_ANY_CAST, e.what());
+		}
+		catch (const std::out_of_range& e) {
+			return ERROR(KEY_NOT_FOUND, e.what());
+		}
+		catch (const nlohmann::json::exception& e) {
+			return ERROR(SYS_LIBRARY_ERROR, e.what());
+		}
+		catch (const std::exception& e) {
+			return ERROR(SYS_INTERNAL_ERR, e.what());
+		}
+		catch (...) {
+			return ERROR(SYS_UNKNOWN_ERROR, "an unknown error occurred");
+		}
 
-namespace
-{
+		// clang-format off
+		log_re::error({
+			{"rule_engine_plugin", rule_engine_name},
+			{"instance_name", _instance_name},
+			{"log_message", "failed to find configuration for plugin"},
+		});
+		// clang-format on
+		auto msg = fmt::format("failed to find configuration for re-python plugin [{}]", _instance_name);
+		return ERROR(SYS_INVALID_INPUT_PARAM, msg);
+
+	}
+
 	irods::error to_irods_error_object(const bp::object& object)
 	{
 		if (bp::extract<int> result{object}; result.check()) {
@@ -264,7 +973,7 @@ namespace
 
 		python_gil_lock& operator=(const python_gil_lock&) = delete;
 
-		inline bool released()
+		BOOST_FORCEINLINE bool released()
 		{
 			return _released;
 		}
@@ -273,7 +982,7 @@ namespace
 		// returns active PyThreadState
 		// doesn't necessarily release the GIL, only this instance's hold on it.
 		// if GIL was acquired further up the stack, it will still be locked. 
-		inline PyThreadState* release()
+		BOOST_FORCEINLINE PyThreadState* release()
 		{
 			if (_released) {
 				THROW(RULE_ENGINE_ERROR, "release called on already-released python_gil_lock");
@@ -291,7 +1000,7 @@ namespace
 		}
 
 		// reacquires GIL after a call to release
-		inline  void reacquire()
+		BOOST_FORCEINLINE void reacquire()
 		{
 			if (_released) {
 				THROW(RULE_ENGINE_ERROR, "reacquire called on non-released python_gil_lock");
@@ -453,15 +1162,196 @@ namespace
 			.def("__getattribute__", &CallbackWrapper::getAttribute);
 	}
 
-	static inline void initialize_python(const std::string& _instance_name)
+#if PY_VERSION_HEX >= 0x03080000
+	static BOOST_FORCEINLINE void populate_PyPreConfig(PyPreConfig& py_preconfig, bool early)
 	{
-		auto etc_irods_path = irods::get_irods_config_directory();
+		if (0 < plugin_configuration::interpreter::isolated) {
+			PyPreConfig_InitIsolatedConfig(&py_preconfig);
+		}
+		else {
+			PyPreConfig_InitPythonConfig(&py_preconfig);
+		}
+
+		py_preconfig.isolated = plugin_configuration::interpreter::isolated;
+		py_preconfig.use_environment = plugin_configuration::interpreter::use_environment;
+
+		if (early) {
+			// don't use user config for these during early preconfig
+			py_preconfig.dev_mode = plugin_configuration::interpreter::defaults::dev_mode;
+			py_preconfig.utf8_mode = plugin_configuration::interpreter::defaults::utf8_mode;
+		}
+		else {
+			py_preconfig.dev_mode = plugin_configuration::interpreter::dev_mode;
+			py_preconfig.utf8_mode = plugin_configuration::interpreter::utf8_mode;
+		}
+
+		if (plugin_configuration::interpreter::configure_locale.has_value()) {
+			py_preconfig.configure_locale = plugin_configuration::interpreter::configure_locale.value();
+		}
+		if (plugin_configuration::interpreter::coerce_c_locale.has_value()) {
+			py_preconfig.coerce_c_locale = plugin_configuration::interpreter::coerce_c_locale.value();
+		}
+		if (plugin_configuration::interpreter::coerce_c_locale_warn.has_value()) {
+			py_preconfig.coerce_c_locale_warn = plugin_configuration::interpreter::coerce_c_locale_warn.value();
+		}
+
+	}
+
+	static BOOST_FORCEINLINE void populate_PyConfig(PyConfig& py_config, bool early)
+	{
+		if (0 < plugin_configuration::interpreter::isolated) {
+			PyConfig_InitIsolatedConfig(&py_config);
+		}
+		else {
+			PyConfig_InitPythonConfig(&py_config);
+		}
+
+		py_config.parse_argv = 0;
+#if PY_VERSION_HEX >= 0x030B0000
+		py_config.safe_path = -1;
+#endif
+
+		py_config.isolated = plugin_configuration::interpreter::isolated;
+		py_config.use_environment = plugin_configuration::interpreter::use_environment;
+
+		if (early) {
+			// don't use user config for these during early preconfig
+			py_config.dev_mode = plugin_configuration::interpreter::defaults::dev_mode;
+			py_config.verbose = plugin_configuration::interpreter::defaults::verbose;
+#ifdef Py_DEBUG
+			py_config.parser_debug = plugin_configuration::interpreter::defaults::parser_debug;
+#endif
+			py_config.tracemalloc = plugin_configuration::interpreter::defaults::tracemalloc;
+			py_config.import_time = plugin_configuration::interpreter::defaults::import_time;
+		}
+		else {
+			py_config.dev_mode = plugin_configuration::interpreter::dev_mode;
+			py_config.verbose = plugin_configuration::interpreter::verbose;
+#ifdef Py_DEBUG
+			py_config.parser_debug = plugin_configuration::interpreter::parser_debug;
+#endif
+			py_config.tracemalloc = plugin_configuration::interpreter::tracemalloc;
+			py_config.import_time = plugin_configuration::interpreter::import_time;
+		}
+
+		if (plugin_configuration::interpreter::hash_seed.has_value()) {
+			py_config.hash_seed = plugin_configuration::interpreter::hash_seed.value();
+		}
+#if PY_VERSION_HEX >= 0x030C0000
+		if (plugin_configuration::interpreter::int_max_str_digits.has_value()) {
+			py_config.int_max_str_digits = plugin_configuration::interpreter::int_max_str_digits.value();
+		}
+		py_config.perf_profiling = plugin_configuration::interpreter::perf_profiling;
+#endif
+
+		if (plugin_configuration::interpreter::xoptions.has_value()) {
+			for (const auto&& xoption : plugin_configuration::interpreter::xoptions.value()) {
+				PyWideStringList_Append(&py_config.xoptions, xoption.c_str());
+			}
+		}
+
+		if (plugin_configuration::interpreter::site_import.has_value()) {
+			py_config.site_import = plugin_configuration::interpreter::site_import.value();
+		}
+		py_config.user_site_directory = plugin_configuration::interpreter::user_site_directory;
+
+		if (plugin_configuration::interpreter::optimization_level.has_value()) {
+			py_config.optimization_level = plugin_configuration::interpreter::optimization_level.value();
+		}
+		if (plugin_configuration::interpreter::write_bytecode.has_value()) {
+			py_config.write_bytecode = plugin_configuration::interpreter::write_bytecode.value();
+		}
+		if (plugin_configuration::interpreter::pycache_prefix.has_value()) {
+			PyConfig_SetString(&config, &config.pycache_prefix, plugin_configuration::interpreter::pycache_prefix.value().c_str());
+		}
+		if (plugin_configuration::interpreter::check_hash_pycs_mode.has_value()) {
+			PyConfig_SetString(&config, &config.check_hash_pycs_mode, plugin_configuration::interpreter::check_hash_pycs_mode.value().c_str());
+		}
+
+		if (plugin_configuration::interpreter::exec_prefix.has_value()) {
+			PyConfig_SetString(&config, &config.exec_prefix, plugin_configuration::interpreter::exec_prefix.value().c_str());
+		}
+		if (plugin_configuration::interpreter::prefix.has_value()) {
+			PyConfig_SetString(&config, &config.prefix, plugin_configuration::interpreter::prefix.value().c_str());
+		}
+
+		if (plugin_configuration::interpreter::filesystem_encoding.has_value()) {
+			PyConfig_SetString(&config, &config.filesystem_encoding, plugin_configuration::interpreter::filesystem_encoding.value().c_str());
+		}
+		if (plugin_configuration::interpreter::filesystem_errors.has_value()) {
+			PyConfig_SetString(&config, &config.filesystem_errors, plugin_configuration::interpreter::filesystem_errors.value().c_str());
+		}
+
+		if (plugin_configuration::interpreter::stdio_encoding.has_value()) {
+			PyConfig_SetString(&config, &config.stdio_encoding, plugin_configuration::interpreter::stdio_encoding.value().c_str());
+		}
+		if (plugin_configuration::interpreter::stdio_errors.has_value()) {
+			PyConfig_SetString(&config, &config.stdio_errors, plugin_configuration::interpreter::stdio_errors.value().c_str());
+		}
+
+		if (plugin_configuration::interpreter::buffered_stdio.has_value()) {
+			py_config.buffered_stdio = plugin_configuration::interpreter::buffered_stdio.value();
+		}
+		if (plugin_configuration::interpreter::configure_c_stdio.has_value()) {
+			py_config.configure_c_stdio = plugin_configuration::interpreter::configure_c_stdio.value();
+		}
+
+		if (plugin_configuration::interpreter::bytes_warning.has_value()) {
+			py_config.bytes_warning = plugin_configuration::interpreter::bytes_warning.value();
+		}
+		if (plugin_configuration::interpreter::pathconfig_warnings.has_value()) {
+			py_config.pathconfig_warnings = plugin_configuration::interpreter::pathconfig_warnings.value();
+		}
+#if PY_VERSION_HEX >= 0x030A0000
+		if (plugin_configuration::interpreter::warn_default_encoding.has_value()) {
+			py_config.warn_default_encoding = plugin_configuration::interpreter::warn_default_encoding.value();
+		}
+#endif
+		if (plugin_configuration::interpreter::warnoptions.has_value()) {
+			for (const auto&& warnoption : plugin_configuration::interpreter::warnoptions.value()) {
+				PyWideStringList_Append(&py_config.warnoptions, warnoption.c_str());
+			}
+		}
+
+	}
+#endif
+
+	static BOOST_FORCEINLINE void initialize_python(const std::string& _instance_name)
+	{
+#if PY_VERSION_HEX >= 0x03080000
+		PyConfig py_config;
+		PyStatus py_status;
+
+		if (!plugin_configuration::interpreter::module_search_paths.has_value()) {
+			// module_search_paths not set - need to pull default paths
+			PyPreConfig py_preconfig_early;
+			populate_PyPreConfig(py_preconfig_early, true);
+			py_status = Py_PreInitialize(&py_preconfig_early);
+
+			if (PyStatus_Exception(py_status)) {
+				// clang-format off
+				log_re::error({
+					{"rule_engine_plugin", rule_engine_name},
+					{"instance_name", _instance_name},
+					{"log_message", "Failed early preinitialization of interpreter"},
+					{"PyStatus.exitcode", fmt::to_string(py_status.exitcode)},
+					{"PyStatus.err_msg", py_status.err_msg},
+					{"PyStatus.func", py_status.func},
+				});
+				// clang-format on
+				auto msg = fmt::format("failed early preinitialization of interpreter for re-python plugin [{}]", _instance_name);
+				return ERROR(SYS_LIBRARY_ERROR, msg);
+			}
+
+			populate_PyPreConfig(py_config, true);
+		}
 
 #if PY_VERSION_HEX >= 0x03080000
 		if (python_state::default_module_search_paths_set) {
 			PyConfig py_config;
 			PyConfig_InitPythonConfig(&py_config);
 
+			py_config.faulthandler = 0;
 			py_config.install_signal_handlers = 0;
 
 			for (auto&& module_search_path : python_state::default_module_search_paths) {
@@ -503,6 +1393,20 @@ namespace
 static irods::error start(irods::default_re_ctx&, const std::string& _instance_name)
 {
 	python_state::ts_main = nullptr;
+
+	irods::error ret = get_re_configs(_instance_name);
+	if (!ret.ok()) {
+		// clang-format off
+		log_re::error({
+			{"rule_engine_plugin", rule_engine_name},
+			{"log_message", "Error loading plugin configuration"},
+			{"instance_name", _instance_name},
+			{"error_result", ret.result()},
+		});
+		// clang-format on
+		return ret;
+	}
+
 	try {
 		PyImport_AppendInittab("plugin_wrappers", &PyInit_plugin_wrappers);
 		PyImport_AppendInittab("irods_types", &PyInit_irods_types);
@@ -547,58 +1451,11 @@ static irods::error start(irods::default_re_ctx&, const std::string& _instance_n
 		4,
 		std::function<int(msParam_t*, msParam_t*, msParam_t*, msParam_t*, ruleExecInfo_t*)>(remote_exec_msvc));
 
-	try {
-		const auto& re_plugin_arr = irods::get_server_property<const nlohmann::json&>(
-			std::vector<std::string>{irods::KW_CFG_PLUGIN_CONFIGURATION, irods::KW_CFG_PLUGIN_TYPE_RULE_ENGINE});
-		for (const auto& plugin_config : re_plugin_arr) {
-			const auto& inst_name = plugin_config.at(irods::KW_CFG_INSTANCE_NAME).get_ref<const std::string&>();
-			if (inst_name == _instance_name) {
-				const auto& plugin_spec_cfg = plugin_config.at(irods::KW_CFG_PLUGIN_SPECIFIC_CONFIGURATION);
-
-				// TODO Enable non core.py Python rulebases
-
-				if (plugin_spec_cfg.count(irods::KW_CFG_RE_PEP_REGEX_SET)) {
-					register_regexes_from_array(plugin_spec_cfg.at(irods::KW_CFG_RE_PEP_REGEX_SET), _instance_name);
-				}
-				else {
-					RuleExistsHelper::Instance()->registerRuleRegex(STATIC_PEP_RULE_REGEX);
-					RuleExistsHelper::Instance()->registerRuleRegex(DYNAMIC_PEP_RULE_REGEX);
-
-					// clang-format off
-					log_re::debug({
-						{"rule_engine_plugin", rule_engine_name},
-						{"instance_name", _instance_name},
-						{"log_message", "No regexes found in server_config for Python RE - using default regexes"},
-						{"static_pep_rule_regex", STATIC_PEP_RULE_REGEX},
-						{"dynamic_pep_rule_regex", DYNAMIC_PEP_RULE_REGEX},
-					});
-					// clang-format on
-				}
-
-				return SUCCESS();
-			}
-		}
-	}
-	catch (const irods::exception& e) {
-		return irods::error(e);
-	}
-	catch (const boost::bad_any_cast& e) {
-		return ERROR(INVALID_ANY_CAST, e.what());
-	}
-	catch (const std::out_of_range& e) {
-		return ERROR(KEY_NOT_FOUND, e.what());
+	for (const auto& re_pep_regex : plugin_configuration::re_pep_regex_set) {
+		RuleExistsHelper::Instance()->registerRuleRegex(re_pep_regex);
 	}
 
-	// clang-format off
-	log_re::error({
-		{"rule_engine_plugin", rule_engine_name},
-		{"instance_name", _instance_name},
-		{"log_message", "failed to find configuration for plugin"},
-	});
-	// clang-format on
-	std::stringstream msg;
-	msg << "failed to find configuration for re-python plugin [" << _instance_name << "]";
-	return ERROR(SYS_INVALID_INPUT_PARAM, msg.str());
+	return SUCCESS();
 }
 
 static irods::error stop(irods::default_re_ctx&, const std::string&)
